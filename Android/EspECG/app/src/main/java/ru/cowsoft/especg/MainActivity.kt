@@ -55,6 +55,8 @@ class MainActivity : ComponentActivity() {
 
     private val discoveredDevices = mutableStateListOf<BluetoothDevice>()
     private var isScanning by mutableStateOf(false)
+    private var isConnected by mutableStateOf(false)
+    private var isPaused by mutableStateOf(false)
     private var packetsReceived by mutableStateOf(0)
     private var lastRawData by mutableStateOf("...")
     private var bluetoothGatt: BluetoothGatt? = null
@@ -168,26 +170,39 @@ class MainActivity : ComponentActivity() {
                                 .padding(horizontal = 16.dp)
                                 .fillMaxWidth()
                         ) {
-                            Button(onClick = {
-                                if (hasPermissions) {
-                                    disconnect() // Безопасно закрываем старое
-                                    statusText = "Поиск..."
-                                    startBleScan(adapter)
-                                    showDialog = true
-                                } else {
-                                    permissionLauncher.launch(requiredPermissions)
+                            if (!isConnected) {
+                                Button(onClick = {
+                                    if (hasPermissions) {
+                                        disconnect()
+                                        statusText = "Поиск..."
+                                        startBleScan(adapter)
+                                        showDialog = true
+                                    } else {
+                                        permissionLauncher.launch(requiredPermissions)
+                                    }
+                                }, modifier = Modifier.weight(1f)) {
+                                    Text("Поиск")
                                 }
-                            }, modifier = Modifier.weight(1f)) {
-                                Text("Поиск")
+                            } else {
+                                Button(onClick = {
+                                    isPaused = !isPaused
+                                }, modifier = Modifier.weight(1f)) {
+                                    Text(if (isPaused) "Продолжить" else "Пауза")
+                                }
                             }
+                                /*
                             Spacer(Modifier.width(8.dp))
+                            
                             Button(
-                                onClick = { disconnect(); statusText = "Остановлено" },
+                                onClick = { 
+                                    disconnect()
+                                    statusText = "Остановлено" 
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = Color.Red),
                                 modifier = Modifier.weight(0.5f)
                             ) {
                                 Text("Стоп")
-                            }
+                            } */
                         }
                     }
 
@@ -231,6 +246,8 @@ class MainActivity : ComponentActivity() {
         }
         bluetoothGatt = null
         packetsReceived = 0
+        isConnected = false
+        isPaused = false
     }
 
     @SuppressLint("MissingPermission")
@@ -256,17 +273,17 @@ class MainActivity : ComponentActivity() {
         }
 
         isScanning = true
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(HEART_RATE_SERVICE_UUID))
-            .build()
+        val filters = listOf(
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(SERVICE_UUID)).build(),
+            ScanFilter.Builder().setServiceUuid(ParcelUuid(HEART_RATE_SERVICE_UUID)).build()
+        )
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        scanner.startScan(listOf(filter), settings, scanCallback)
-        //scanner.startScan(null, settings, scanCallback)
-        Log.d("BLE_SCAN", "Scan started")
+        scanner.startScan(filters, settings, scanCallback)
+        Log.d("BLE_SCAN", "Scan started with filters")
 
         android.os.Handler(mainLooper).postDelayed({ stopBleScan(adapter) }, 10000)
     }
@@ -285,19 +302,9 @@ class MainActivity : ComponentActivity() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device
             val name = getDeviceDisplayName(device)
-            val serviceUuids = result.scanRecord?.serviceUuids
-
-            // Фильтр: Ищем по UUID DEAD
-            //val isTarget = serviceUuids?.any { it.uuid == HEART_RATE_SERVICE_UUID } == true
-
-            val isTarget = true
-            if (isTarget && discoveredDevices.none { it.address == device.address }) {
+            if (discoveredDevices.none { it.address == device.address }) {
                 Log.d("BLE_SCAN", "Found target: $name [${device.address}]")
                 discoveredDevices.add(device)
-            } else if (discoveredDevices.none { it.address == device.address }) {
-                // Для отладки можно временно добавить все устройства
-                // discoveredDevices.add(device)
-                Log.d("BLE_SCAN", "Found other: $name [${device.address}]")
             }
         }
 
@@ -318,7 +325,10 @@ class MainActivity : ComponentActivity() {
                     gatt.requestMtu(512)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     Log.d("BLE", "Disconnected")
-                    runOnUiThread { onResult(false) }
+                    runOnUiThread { 
+                        isConnected = false
+                        onResult(false) 
+                    }
                     gatt.close()
                 }
             }
@@ -330,7 +340,7 @@ class MainActivity : ComponentActivity() {
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                 if (status == BluetoothGatt.GATT_SUCCESS) {
-                    val service = gatt.getService(SERVICE_UUID)
+                    val service = gatt.getService(SERVICE_UUID) ?: gatt.getService(HEART_RATE_SERVICE_UUID)
                     val characteristic = service?.getCharacteristic(CHARACTERISTIC_UUID)
 
                     if (characteristic != null) {
@@ -349,7 +359,10 @@ class MainActivity : ComponentActivity() {
                                 gatt.writeDescriptor(descriptor)
                             }
                             Log.d("BLE", "Notifications enabled")
-                            runOnUiThread { onResult(true) }
+                            runOnUiThread { 
+                                isConnected = true
+                                onResult(true) 
+                            }
                         }
                     } else {
                         Log.e("BLE", "Target characteristic not found")
@@ -375,7 +388,7 @@ class MainActivity : ComponentActivity() {
             }
 
             private fun processData(bytes: ByteArray?) {
-                if (bytes == null) return
+                if (bytes == null || isPaused) return
                 val shortBuffer =
                     ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
                 val points = mutableListOf<Float>()
@@ -408,7 +421,7 @@ class MainActivity : ComponentActivity() {
     ) {
         AlertDialog(
             onDismissRequest = onDismiss,
-            title = { Text(if (isScanning) "Поиск ESP32..." else "Выберите устройство") },
+            title = { Text(if (isScanning) "Поиск устройств..." else "Выберите устройство") },
             text = {
                 Column {
                     if (isScanning) LinearProgressIndicator(
@@ -416,7 +429,7 @@ class MainActivity : ComponentActivity() {
                             .fillMaxWidth()
                             .padding(vertical = 8.dp)
                     )
-                    if (devices.isEmpty() && !isScanning) Text("Устройства не найдены. Проверьте питание ESP32 и GPS.")
+                    if (devices.isEmpty() && !isScanning) Text("Устройства не найдены. Проверьте питание устройства и GPS.")
                     LazyColumn(modifier = Modifier.height(300.dp)) {
                         items(devices) { device ->
                             ListItem(
@@ -444,7 +457,6 @@ fun ECGChart(
     Canvas(modifier = modifier) {
         val stepX = size.width / (maxPoints.coerceAtLeast(2) - 1)
 
-        // СЕТКА (10мс, 50мс, 200мс)
         val pts10ms = samplingRate / 100
         val pts50ms = pts10ms * 5
         val pts200ms = pts50ms * 4
@@ -475,7 +487,6 @@ fun ECGChart(
         fun getY(v: Float) =
             size.height - (((v - minVal) / range) * size.height * 0.8f + size.height * 0.1f)
 
-        // Рисуем основной сигнал
         val pathNew = Path()
         for (i in 0 until currentPos) {
             val x = i * stepX
@@ -484,7 +495,6 @@ fun ECGChart(
         }
         drawPath(pathNew, Color(0xFF00FF44), style = Stroke(width = 3.dp.toPx()))
 
-        // Рисуем "хвост" старого сигнала
         if (currentPos + gap < maxPoints) {
             val pathOld = Path()
             var first = true
@@ -502,7 +512,6 @@ fun ECGChart(
             )
         }
 
-        // Точка-перо
         if (currentPos > 0) {
             drawCircle(
                 Color.White,
